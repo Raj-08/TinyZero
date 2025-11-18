@@ -160,18 +160,31 @@ class vLLMRollout(BaseRollout):
             idx_list.append(_pre_process_inputs(self.pad_token_id, idx[i]))
 
         do_sample = prompts.meta_info.get('do_sample', True)
+
+        # Base sampling overrides (for greedy generation, etc.)
+        sampling_kwargs = {}
         if not do_sample:
-            kwargs = {
+            sampling_kwargs.update({
                 'best_of': 1,
                 'top_p': 1.0,
                 'top_k': -1,
                 'min_p': 0.0,
                 'temperature': 0,
-                'n': 1  # if greedy, only 1 response
-            }
+                'n': 1,  # if greedy, only 1 response
+            })
+
+        # Adaptive window override via meta_info (the "max_tokens" hook)
+        adaptive_max_tokens = prompts.meta_info.get('max_tokens', None)
+        if adaptive_max_tokens is not None:
+            adaptive_max_tokens = int(adaptive_max_tokens)
+            sampling_kwargs['max_tokens'] = adaptive_max_tokens
+            print(f"[vLLM] Adaptive window override: max_tokens={adaptive_max_tokens}")
+
+        # Merge any caller-provided kwargs last to allow explicit overrides
+        sampling_kwargs.update(kwargs)
 
         # users can customize different sampling_params at different run
-        with self.update_sampling_params(**kwargs):
+        with self.update_sampling_params(**sampling_kwargs):
             output = self.inference_engine.generate(
                 prompts=None,  # because we have already convert it to prompt token id
                 sampling_params=self.sampling_params,

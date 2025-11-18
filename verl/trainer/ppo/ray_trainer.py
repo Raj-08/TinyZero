@@ -33,6 +33,7 @@ from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
+from verl.trainer.ppo.adaptive_window import AdaptiveSuccessWindowConfig, AdaptiveSuccessWindowController
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 
 WorkerType = Type[Worker]
@@ -275,11 +276,139 @@ def compute_timing_metrics(batch, timing_raw):
             f'timing_s/{name}': value for name, value in timing_raw.items()
         },
         **{
-            f'timing_per_token_ms/{name}': timing_raw[name] * 1000 / num_tokens_of_section[name] for name in set(num_tokens_of_section.keys(
-            )) & set(timing_raw.keys())
+            f'timing_per_token_ms/{name}': timing_raw[name] * 1000 / num_tokens_of_section[name] for name in set(
+                num_tokens_of_section.keys()) & set(timing_raw.keys())
         },
+        # Token usage statistics (per step, summed over the batch)
+        "tokens/prompt_total": num_prompt_tokens,
+        "tokens/response_total": num_response_tokens,
+        "tokens/overall_total": num_overall_tokens,
     }
 
+
+def compute_completion_metrics(batch, generation_budget: int):
+    """Compute fractions of truncated / finished responses and their correctness.
+
+    Args:
+        batch: DataProto after rollout + reward computation.
+        generation_budget: The effective max number of response tokens allowed
+            during generation (e.g., max_response_length or adaptive window).
+    """
+    response_info = _compute_response_info(batch)
+    response_length = response_info['response_length']  # (batch_size,)
+
+    # Identify responses that hit (or exceed) the generation budget.
+    truncated_mask = response_length >= generation_budget
+    finished_mask = ~truncated_mask
+
+    batch_size = response_length.shape[0]
+    if batch_size == 0:
+        return {
+            "completion/truncated_frac": 0.0,
+            "completion/finished_frac": 0.0,
+            "completion/truncated_correct_frac": 0.0,
+            "completion/finished_correct_frac": 0.0,
+            "completion/correct_mean_length": 0.0,
+        }
+
+    truncated_frac = truncated_mask.float().mean().item()
+    finished_frac = finished_mask.float().mean().item()
+
+    # Sequence-level raw task score (before KL), e.g. 0, 0.1, 1.0 for countdown.
+    if 'token_level_scores' in batch.batch:
+        token_level_scores = batch.batch['token_level_scores']
+        seq_scores = token_level_scores.sum(-1)
+        correct_mask = seq_scores >= 0.99  # treat ~1.0 as strictly correct
+    else:
+        # Fallback: no notion of correctness
+        correct_mask = torch.zeros_like(response_length, dtype=torch.bool)
+
+    truncated_count = truncated_mask.float().sum().item()
+    finished_count = finished_mask.float().sum().item()
+
+    correct_count = correct_mask.float().sum().item()
+    if correct_count > 0:
+        correct_mean_length = (response_length[correct_mask].float().mean().item())
+    else:
+        correct_mean_length = 0.0
+
+    if truncated_count > 0:
+        truncated_correct_frac = (truncated_mask & correct_mask).float().sum().item() / truncated_count
+    else:
+        truncated_correct_frac = 0.0
+
+    if finished_count > 0:
+        finished_correct_frac = (finished_mask & correct_mask).float().sum().item() / finished_count
+    else:
+        finished_correct_frac = 0.0
+
+    return {
+        "completion/truncated_frac": truncated_frac,
+        "completion/finished_frac": finished_frac,
+        "completion/truncated_correct_frac": truncated_correct_frac,
+        "completion/finished_correct_frac": finished_correct_frac,
+        # Average response length among strictly-correct answers
+        "completion/correct_mean_length": correct_mean_length,
+    }
+
+
+def compute_difficulty_metrics(batch):
+    """Compute accuracy broken down by difficulty level (e.g. 3 vs 4).
+
+    We assume that non_tensor_batch['reward_model'][i]['ground_truth'] contains
+    a 'difficulty' field for each sample.
+    """
+    if 'token_level_scores' not in batch.batch:
+        return {}
+
+    # Sequence-level raw scores to determine correctness.
+    token_level_scores = batch.batch['token_level_scores']
+    seq_scores = token_level_scores.sum(-1)
+    correct_mask = seq_scores >= 0.99  # strictly correct
+
+    rm_info = batch.non_tensor_batch.get('reward_model', None)
+    if rm_info is None:
+        return {}
+
+    # Extract per-sample difficulty if available.
+    difficulties = []
+    for i in range(len(seq_scores)):
+        info = rm_info[i]
+        gt = info.get('ground_truth', {})
+        difficulties.append(gt.get('difficulty', None))
+
+    # Compute counts and accuracies for difficulty 3 and 4.
+    diff3_total = 0
+    diff3_correct = 0
+    diff4_total = 0
+    diff4_correct = 0
+
+    for i, d in enumerate(difficulties):
+        if d == 3:
+            diff3_total += 1
+            if correct_mask[i]:
+                diff3_correct += 1
+        elif d == 4:
+            diff4_total += 1
+            if correct_mask[i]:
+                diff4_correct += 1
+
+    metrics = {}
+    if diff3_total > 0:
+        metrics["difficulty/3_acc"] = diff3_correct / diff3_total
+        metrics["difficulty/3_count"] = float(diff3_total)
+    else:
+        metrics["difficulty/3_acc"] = 0.0
+        metrics["difficulty/3_count"] = 0.0
+
+    if diff4_total > 0:
+        metrics["difficulty/4_acc"] = diff4_correct / diff4_total
+        metrics["difficulty/4_count"] = float(diff4_total)
+    else:
+        metrics["difficulty/4_acc"] = 0.0
+        metrics["difficulty/4_count"] = 0.0
+
+    return metrics
 
 @contextmanager
 def _timer(name: str, timing_raw: Dict[str, float]):
@@ -323,6 +452,17 @@ class RayPPOTrainer(object):
         self.use_rm = Role.RewardModel in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
 
+        # Adaptive window controller (for dynamic max_tokens) ----------------
+        self._adaptive_window: AdaptiveSuccessWindowController | None = None
+        agent_cfg = self.config.get('agent', None)
+        if agent_cfg is not None:
+            adaptive_cfg = agent_cfg.get('adaptive_window', None)
+            if adaptive_cfg is not None and adaptive_cfg.get('enable', False):
+                # Convert OmegaConf node into a plain dict and hydrate dataclass
+                adaptive_cfg_dict = OmegaConf.to_container(adaptive_cfg, resolve=True)
+                aw_config = AdaptiveSuccessWindowConfig(**adaptive_cfg_dict)
+                self._adaptive_window = AdaptiveSuccessWindowController(config=aw_config)
+
         # define KL control
         if self.use_reference_policy:
             if config.algorithm.kl_ctrl.type == 'fixed':
@@ -338,6 +478,10 @@ class RayPPOTrainer(object):
             self.kl_ctrl = core_algos.FixedKLController(kl_coef=0.)
 
         self._create_dataloader()
+
+        # Track cumulative rewards and elapsed wall-clock time over the run.
+        self._cumulative_reward: float = 0.0
+        self._elapsed_time_s: float = 0.0
 
     def _create_dataloader(self):
         from torch.utils.data import DataLoader
@@ -427,17 +571,24 @@ class RayPPOTrainer(object):
 
         reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
         data_sources = np.concatenate(data_source_lst, axis=0)
-        # evaluate test_score based on data source
+        # evaluate test_score and strict accuracy based on data source
         data_source_reward = {}
+        data_source_correct = {}
         for i in range(reward_tensor.shape[0]):
             data_source = data_sources[i]
             if data_source not in data_source_reward:
                 data_source_reward[data_source] = []
-            data_source_reward[data_source].append(reward_tensor[i].item())
+                data_source_correct[data_source] = []
+            r = reward_tensor[i].item()
+            data_source_reward[data_source].append(r)
+            # Treat exactly-correct answers (score ~ 1.0) as success.
+            data_source_correct[data_source].append(1.0 if r >= 0.99 else 0.0)
 
         metric_dict = {}
         for data_source, rewards in data_source_reward.items():
             metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+            # Strict correctness (0/1) averaged over eval set
+            metric_dict[f'val/acc/{data_source}'] = np.mean(data_source_correct[data_source])
 
         return metric_dict
 
@@ -583,6 +734,12 @@ class RayPPOTrainer(object):
                 # pop those keys for generation
                 gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
 
+                # Set dynamic max_tokens for rollout via meta_info (if enabled)
+                if self._adaptive_window is not None:
+                    max_tokens = self._adaptive_window.get_window_size()
+                    # Meta-info is used by the rollout worker (e.g. vLLM) to override max_tokens.
+                    gen_batch.meta_info.setdefault('max_tokens', max_tokens)
+
                 with _timer('step', timing_raw):
                     # generate a batch
                     with _timer('gen', timing_raw):
@@ -643,6 +800,18 @@ class RayPPOTrainer(object):
                                                   lam=self.config.algorithm.lam,
                                                   num_repeat=self.config.actor_rollout_ref.rollout.n)
 
+                        # Accumulate total rewards (after KL shaping if used)
+                        step_total_reward = batch.batch['token_level_rewards'].sum().item()
+                        self._cumulative_reward += step_total_reward
+                        metrics["train/cumulative_reward"] = self._cumulative_reward
+
+                        # Update adaptive window controller and log its metrics
+                        if self._adaptive_window is not None:
+                            aw_metrics = self._adaptive_window.update_from_batch(
+                                batch=batch,
+                                reward_tensor=batch.batch['token_level_rewards'])
+                            metrics.update(aw_metrics)
+
                     # update critic
                     if self.use_critic:
                         with _timer('update_critic', timing_raw):
@@ -673,6 +842,24 @@ class RayPPOTrainer(object):
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                # Track cumulative elapsed wall-clock time (sum of 'step' durations).
+                if 'step' in timing_raw:
+                    self._elapsed_time_s += float(timing_raw['step'])
+                metrics["time/elapsed_s"] = self._elapsed_time_s
+
+                # Difficulty-specific accuracy (e.g., levels 3 and 4).
+                difficulty_metrics = compute_difficulty_metrics(batch=batch)
+                metrics.update(difficulty_metrics)
+
+                # Completion statistics: truncated vs finished and correctness.
+                # For adaptive runs we use the current adaptive window as budget,
+                # otherwise fall back to the configured max response length.
+                if hasattr(self, "_adaptive_window") and self._adaptive_window is not None:
+                    generation_budget = int(self._adaptive_window.get_window_size())
+                else:
+                    generation_budget = int(self.config.data.max_response_length)
+                completion_metrics = compute_completion_metrics(batch=batch, generation_budget=generation_budget)
+                metrics.update(completion_metrics)
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)

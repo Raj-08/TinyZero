@@ -1,0 +1,26 @@
+#!/bin/bash
+# SLURM job for TinyZero adaptive-window training
+
+#SBATCH --job-name=tinyzero_adaptive
+#SBATCH --partition=gpu_a100
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=36
+#SBATCH --mem=240G
+#SBATCH --time=24:00:00
+
+
+
+conda activate zero
+
+export DATA_DIR=${DATA_DIR:-$PWD}
+export BASE_MODEL=${BASE_MODEL:-deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B}
+export N_GPUS=${N_GPUS:-4}
+export ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE:-2}
+export EXPERIMENT_NAME=${EXPERIMENT_NAME:-tinyzero_adaptive}
+
+# Run adaptive-window training (4K max context, ARPO controller).
+bash scripts/train_tiny_zero_adaptive.sh
+
+

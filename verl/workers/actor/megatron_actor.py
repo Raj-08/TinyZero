@@ -267,19 +267,55 @@ class MegatronPPOActor(BasePPOActor):
             logits = output.logits
             logits = logits[:, -response_length - 1:-1]
             log_prob = vocab_parallel_log_probs_from_logits(logits, responses)
-            pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
-                                                                          log_prob=log_prob,
-                                                                          advantages=advantages,
-                                                                          eos_mask=response_mask,
-                                                                          cliprange=clip_ratio)
+            pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(
+                old_log_prob=old_log_prob,
+                log_prob=log_prob,
+                advantages=advantages,
+                eos_mask=response_mask,
+                cliprange=clip_ratio,
+            )
             entropy_loss = vocab_parallel_compute_entropy_loss(logits, eos_mask=response_mask)
             policy_loss = pg_loss - entropy_loss * entropy_coeff
+            # Importance-sampling ratio statistics for theoretical analysis
+            with torch.no_grad():
+                log_ratio = log_prob - old_log_prob  # log π_new - log π_old
+                ratio = torch.exp(log_ratio)
+                mask = response_mask.bool()
+
+                flat_ratio = ratio[mask]
+                flat_log_ratio = log_ratio[mask]
+
+                lower = 1.0 - clip_ratio
+                upper = 1.0 + clip_ratio
+                outside = (flat_ratio < lower) | (flat_ratio > upper)
+
+                if flat_ratio.numel() > 0:
+                    is_mean = flat_ratio.mean().item()
+                    is_std = flat_ratio.std(unbiased=False).item()
+                    is_p95 = torch.quantile(flat_ratio, 0.95).item()
+
+                    log_is_mean = flat_log_ratio.mean().item()
+                    log_is_std = flat_log_ratio.std(unbiased=False).item()
+
+                    outside_frac = outside.float().mean().item()
+                else:
+                    is_mean = is_std = is_p95 = 0.0
+                    log_is_mean = log_is_std = 0.0
+                    outside_frac = 0.0
+
             # return loss and stats
             stats = {
                 'actor/entropy_loss': entropy_loss.detach().item(),
                 'actor/pg_loss': pg_loss.detach().item(),
                 'actor/pg_clipfrac': pg_clipfrac.detach().item(),
-                'actor/ppo_kl': ppo_kl.detach().item()
+                'actor/ppo_kl': ppo_kl.detach().item(),
+                # IS ratio stats
+                'actor/is_ratio/mean': is_mean,
+                'actor/is_ratio/std': is_std,
+                'actor/is_ratio/p95': is_p95,
+                'actor/is_log_ratio/mean': log_is_mean,
+                'actor/is_log_ratio/std': log_is_std,
+                'actor/is_clip/outside_frac': outside_frac,
             }
             return policy_loss, stats
 

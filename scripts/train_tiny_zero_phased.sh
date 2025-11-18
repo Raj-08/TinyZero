@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Manual phase-based TinyZero training with fixed response lengths.
+# Usage:
+#   bash scripts/train_tiny_zero_phased.sh 1   # phase 1 (short)
+#   bash scripts/train_tiny_zero_phased.sh 2   # phase 2 (medium)
+#   bash scripts/train_tiny_zero_phased.sh 3   # phase 3 (long)
+#
+# You can run these phases sequentially with different EXPERIMENT_NAMEs
+# or extend the script with checkpoint loading if you want true curriculum
+# training over the same weights.
+
+set -euo pipefail
+
+PHASE="${1:-1}"
+
+case "$PHASE" in
+  1)
+    MAX_RESP_LEN=512
+    EXP_SUFFIX="phase1_len512"
+    ;;
+  2)
+    MAX_RESP_LEN=1024
+    EXP_SUFFIX="phase2_len1024"
+    ;;
+  3)
+    MAX_RESP_LEN=2048
+    EXP_SUFFIX="phase3_len2048"
+    ;;
+  *)
+    echo "Unknown phase '$PHASE'. Use 1, 2, or 3."
+    exit 1
+    ;;
+esac
+
+: "${DATA_DIR:?Must set DATA_DIR}"
+: "${BASE_MODEL:?Must set BASE_MODEL}"
+: "${N_GPUS:?Must set N_GPUS}"
+: "${ROLLOUT_TP_SIZE:?Must set ROLLOUT_TP_SIZE}"
+: "${EXPERIMENT_NAME:=tinyzero_phased}"
+
+python3 -m verl.trainer.main_ppo \
+data.train_files=$DATA_DIR/train.parquet \
+data.val_files=$DATA_DIR/test.parquet \
+data.train_batch_size=256 \
+data.val_batch_size=1312 \
+data.max_prompt_length=256 \
+data.max_response_length=$MAX_RESP_LEN \
+actor_rollout_ref.model.path=$BASE_MODEL \
+actor_rollout_ref.model.use_remove_padding=True \
+actor_rollout_ref.actor.use_dynamic_bsz=True \
+actor_rollout_ref.actor.optim.lr=1e-6 \
+actor_rollout_ref.actor.ppo_mini_batch_size=72 \
+actor_rollout_ref.actor.ppo_micro_batch_size=12 \
+actor_rollout_ref.rollout.log_prob_micro_batch_size=12 \
+actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP_SIZE \
+actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+actor_rollout_ref.ref.log_prob_micro_batch_size=6 \
+critic.optim.lr=1e-5 \
+critic.model.path=$BASE_MODEL \
+critic.ppo_mini_batch_size=72 \
+critic.ppo_micro_batch_size=12 \
+algorithm.kl_ctrl.kl_coef=0.001 \
+trainer.logger=['wandb'] \
+trainer.val_before_train=False \
+trainer.default_hdfs_dir=null \
+trainer.n_gpus_per_node=$N_GPUS \
+trainer.nnodes=1 \
+trainer.save_freq=500 \
+trainer.test_freq=100 \
+trainer.project_name=TinyZero \
+trainer.experiment_name=${EXPERIMENT_NAME}_$EXP_SUFFIX \
+trainer.total_epochs=15 2>&1 | tee verl_demo_${EXP_SUFFIX}.log
+
+

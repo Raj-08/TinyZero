@@ -34,13 +34,26 @@ def _select_rm_score_fn(data_source):
         raise NotImplementedError
 
 
+import math
+
+
+def _cosine_schedule(t: int, T: int, eta_min: float, eta_max: float) -> float:
+    """CosFn(t, T, eta_min, eta_max) from the CoT paper."""
+    if T <= 0:
+        return eta_min
+    t_clamped = max(0, min(t, T))
+    return eta_min + 0.5 * (eta_max - eta_min) * (1.0 + math.cos(t_clamped * math.pi / T))
+
+
 class RewardManager():
     """The reward manager.
     """
 
-    def __init__(self, tokenizer, num_examine) -> None:
+    def __init__(self, tokenizer, num_examine, cosine_cfg=None) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
+        self.cosine_cfg = cosine_cfg or {}
+        self.use_cosine = bool(self.cosine_cfg.get('enable', False))
 
     def __call__(self, data: DataProto):
         """We will expand this function gradually based on the available datasets"""
@@ -70,6 +83,10 @@ class RewardManager():
             # decode
             sequences = torch.cat((valid_prompt_ids, valid_response_ids))
             sequences_str = self.tokenizer.decode(sequences)
+            # Trim spurious special tokens such as repeated <|endoftext|>
+            # that may appear in generation tails. This does not affect the
+            # semantic content of the countdown answers.
+            sequences_str = sequences_str.replace("<|endoftext|>", "")
 
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
 
@@ -78,7 +95,29 @@ class RewardManager():
             compute_score_fn = _select_rm_score_fn(data_source)
 
             score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth)
-            reward_tensor[i, valid_response_length - 1] = score
+
+            # Optionally apply cosine reward shaping based on generation length.
+            if self.use_cosine:
+                L_gen = int(valid_response_length.item())
+                L_max = int(self.cosine_cfg.get('L_max', L_gen))
+                # Decide correctness from the base score
+                correct_threshold = float(self.cosine_cfg.get('correct_threshold', 0.5))
+                is_correct = score >= correct_threshold
+
+                if L_gen >= L_max:
+                    shaped = float(self.cosine_cfg.get('r_e', -1.0))
+                else:
+                    if is_correct:
+                        r0 = float(self.cosine_cfg.get('r_c0', 0.5))
+                        rL = float(self.cosine_cfg.get('r_cL', 1.0))
+                    else:
+                        r0 = float(self.cosine_cfg.get('r_w0', -0.1))
+                        rL = float(self.cosine_cfg.get('r_wL', -1.0))
+                    shaped = _cosine_schedule(t=L_gen, T=L_max, eta_min=r0, eta_max=rL)
+
+                reward_tensor[i, valid_response_length - 1] = shaped
+            else:
+                reward_tensor[i, valid_response_length - 1] = score
 
             if data_source not in already_print_data_sources:
                 already_print_data_sources[data_source] = 0
@@ -171,10 +210,11 @@ def main_task(config):
         role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
         mapping[Role.RewardModel] = global_pool_id
 
-    reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0)
+    cosine_cfg = getattr(config.algorithm, "cosine_reward", None)
+    reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0, cosine_cfg=cosine_cfg)
 
     # Note that we always use function-based RM for validation
-    val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=1)
+    val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=1, cosine_cfg=cosine_cfg)
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 

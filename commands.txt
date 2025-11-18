@@ -1,0 +1,572 @@
+# =============================================================================
+# RLLM Training Commands with Dynamic GPU Configuration
+# =============================================================================
+# 
+# NEW: Use the num_gpus parameter to dynamically configure GPU usage
+# 
+# Examples:
+# 
+# Train with 4 GPUs:
+# ./rllm/scripts/train/train_with_gpu_config.sh --num_gpus 4 --model_name "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+# 
+# Train with 2 GPUs and custom parameters:
+# ./rllm/scripts/train/train_with_gpu_config.sh --num_gpus 2 --batch_size 8 --learning_rate 2e-5
+# 
+# Train with 1 GPU (for debugging):
+# ./rllm/scripts/train/train_with_gpu_config.sh --num_gpus 1 --total_epochs 1
+# 
+# Legacy commands (still work but use hardcoded GPU counts):
+# torchrun --nproc_per_node=2 --master_port=12345 train_countdown.py
+# 
+# =============================================================================
+
+# SLURM commands for different GPU configurations
+# 1 GPU
+srun --partition=gpu_a100 \
+     --gpus=1 \
+     --ntasks=1 \
+     --cpus-per-task=9 \
+     --mem=61434 \
+     --time=01:00:00 \
+     --pty bash -i
+
+# 2 GPUs  
+srun --partition=gpu_a100 \
+     --nodes=1 \
+     --ntasks=1 \
+     --gres=gpu:4 \
+     --cpus-per-task=36 \
+     --mem=240G \
+     --time=01:00:00 \
+     --pty bash -i
+
+# 4 GPUs
+srun --partition=gpu_a100 \
+     --nodes=1 \
+     --ntasks=1 \
+     --gres=gpu:4 \
+     --cpus-per-task=72 \
+     --mem=480G \
+     --time=02:00:00 \
+     --pty bash -i
+
+# 8 GPUs (full node)
+srun --partition=gpu_a100 \
+     --nodes=1 \
+     --ntasks=1 \
+     --gres=gpu:8 \
+     --cpus-per-task=144 \
+     --mem=960G \
+     --time=04:00:00 \
+     --pty bash -i
+
+# =============================================================================
+# Environment Setup Commands
+# =============================================================================
+
+# First check available CUDA modules
+module spider cuda
+
+# Load modules in correct order
+module purge
+module load 2023
+module load CUDA/12.4.0
+module load Anaconda3/2023.07-2
+
+# Verify CUDA is now available
+nvcc --version
+
+# Set CUDA environment variables
+export CUDA_HOME=/sw/arch/Centos8/EB_production/2023/software/CUDA/12.4.0
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+
+# Now create environment and install
+conda create -n rllm_venv python=3.10 -y
+source activate rllm_venv
+source activate verl
+
+pip install -e ./verl
+pip install -e .
+
+# =============================================================================
+# Training Commands with Dynamic GPU Configuration
+# =============================================================================
+
+# Use the new dynamic GPU script (recommended)
+python -m rllm.trainer.adaptive_ppo \
+    --model_name "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B" \
+    --data_dir "data" \
+    --output_dir "outputs" \
+    --batch_size 4 \
+    --gradient_accumulation_steps 4 \
+    --learning_rate 1e-5 \
+    --max_length 8192 \
+    --initial_window_size 8192 \
+    --window_sizes 8192 16384 24576 32768 \
+    --clipping_threshold 0.05 \
+    --patience 100 \
+    --meta_controller_lr 1e-4 \
+    --base_reward_weight 1.0 \
+    --length_reward_weight 0.3 \
+    --incremental_reward_weight 0.2 \
+    --save_freq 1000 \
+    --test_freq 1000 \
+    --total_epochs 1 \
+    --logger wandb \
+    --project_name "rllm" \
+    --experiment_name "adaptive_ppo" \
+    --tensor_model_parallel_size 1 \
+    --gpu_memory_utilization 0.4 \
+    --ppo_mini_batch_size 128 \
+    --ppo_micro_batch_size 16 \
+    --critic_lr 1e-5 \
+    --kl_coef 0.001 \
+    --num_gpus 8  # NEW: Specify number of GPUs
+
+# =============================================================================
+# Ray Cluster Setup
+# =============================================================================
+
+ray start --head \
+    --node-ip-address=$(hostname -I | awk '{print $1}') \
+    --port=6379 \
+    --dashboard-host=0.0.0.0 \
+    --ray-client-server-port=10001
+
+# =============================================================================
+# Legacy Training Commands (Updated with num_gpus parameter)
+# =============================================================================
+
+# Sample-based adaptive-COT (200 steps per window size)
+torchrun --nproc_per_node=2 --master_port=12345 train_countdown.py \
+    --adaptive_cot \
+    --steps_per_window 200 \
+    --sample_adaptive \
+    --sample_size 100 \
+    --eval_interval 200 \
+    --total_steps 1000 \
+    --slack 100 \
+    --save_freq 200 \
+    --num_gpus 2  # NEW: Specify number of GPUs
+
+# Baseline full-context training (static)
+torchrun --nproc_per_node=2 --master_port=12345 train_countdown.py \
+    --baseline \
+    --save_freq 200 \
+    --num_gpus 2  # NEW: Specify number of GPUs
+
+# Adaptive CoT only (no sample-based scheduling)
+torchrun --nproc_per_node=2 --master_port=12345 train_countdown.py \
+    --adaptive_cot \
+    --steps_per_window 200 \
+    --save_freq 200 \
+    --num_gpus 2  # NEW: Specify number of GPUs
+
+# Curriculum learning: train sequentially on n=3,4,5 numbers
+torchrun --nproc_per_node=2 --master_port=12345 train_countdown.py \
+    --curriculum \
+    --cl_num_samples 600 \
+    --cl_steps 200 \
+    --slack 100 \
+    --save_freq 200 \
+    --num_gpus 2  # NEW: Specify number of GPUs
+
+# Legacy inference (if needed)
+torchrun --nproc_per_node=2 --master_port=12345 inference_countdown.py \
+    --num_gpus 2  # NEW: Specify number of GPUs
+
+# =============================================================================
+# Multi-node Training Examples
+# =============================================================================
+
+# Single node with 2 GPUs
+torchrun --nnodes=1 --nproc_per_node=2 train_countdown.py \
+  --curriculum \
+  --cl_num_samples 1000 \
+  --cl_steps 200 \
+  --slack 100 \
+  --num_gpus 2  # NEW: Specify number of GPUs
+
+# Multi-node training (example)
+# torchrun --nnodes=2 --nproc_per_node=8 train_countdown.py \
+#   --curriculum \
+#   --cl_num_samples 1000 \
+#   --cl_steps 200 \
+#   --slack 100 \
+#   --num_gpus 16  # Total GPUs across all nodes
+
+# =============================================================================
+# Advanced Training Examples
+# =============================================================================
+
+# Self-aware training with 2 GPUs
+torchrun --nproc_per_node=2 --master_port=12345 train_countdown.py \
+  --self_aware \
+  --cl_num_samples 2 \
+  --cl_steps 2 \
+  --num_gpus 2  # NEW: Specify number of GPUs
+
+# Baseline with fixed window and 2 GPUs
+torchrun --nproc_per_node=2 --master_port=12345 \
+         train_countdown.py --baseline --fixed_window 6400 \
+         --total_steps 2 \
+         --num_gpus 2  # NEW: Specify number of GPUs
+
+# =============================================================================
+# Evaluation Commands
+# =============================================================================
+
+echo "Evaluating base model (no fine-tuning)..."
+python evaluate_model.py \
+    --checkpoint_path ./checkpoints/baseline_800/ \
+    --model_name   deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B\
+    --test_data ./data/test_dataset.pkl \
+    --window_size 800 \
+    --output_dir "evaluation_results/base_model" \
+    --save_plots \
+    --num_gpus 2  # NEW: Specify number of GPUs for evaluation
+
+python -m examples.deepscaler.train_deepscaler \
+    num_gpus=4 \
+    algorithm.adv_estimator=grpo \
+    data.train_batch_size=128 \
+    data.val_batch_size=30 \
+    data.max_prompt_length=2048 \
+    actor_rollout_ref.model.path=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+    actor_rollout_ref.hybrid_engine=True \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean \
+    actor_rollout_ref.actor.ppo_mini_batch_size=64 \
+    actor_rollout_ref.actor.use_dynamic_bsz=True \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=30000 \
+    actor_rollout_ref.actor.use_kl_loss=False \
+    actor_rollout_ref.actor.clip_ratio_high=0.28 \
+    actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
+    actor_rollout_ref.actor.grad_norm_threshold=10 \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.actor.fsdp_config.param_offload=True \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.mode="async" \
+    actor_rollout_ref.rollout.chat_scheduler=verl.schedulers.completions_scheduler.CompletionsScheduler \
+    actor_rollout_ref.rollout.enforce_eager=False \
+    actor_rollout_ref.rollout.temperature=0.6 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
+    actor_rollout_ref.rollout.n=8 \
+    actor_rollout_ref.rollout.val_kwargs.n=8 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
+    actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.entropy_coeff=0 \
+    algorithm.kl_ctrl.kl_coef=0.001 \
+    algorithm.mask_truncated_samples=False \
+    algorithm.clip_advantages=False \
+    trainer.critic_warmup=0 \
+    trainer.logger=['console','wandb'] \
+    trainer.project_name='rllm-agent' \
+    trainer.experiment_name='deepscaler-1.5b-drpo' \
+    trainer.val_before_train=True \
+    trainer.n_gpus_per_node=8 \
+    trainer.nnodes=1 \
+    trainer.save_freq=20 \
+    trainer.test_freq=20 \
+    trainer.default_hdfs_dir=null \
+    agent.max_steps=1 \
+    agent.use_stepwise_advantage=False \
+    trainer.total_epochs=100 \
+    agent.adaptive_window.enable=True \
+    agent.adaptive_window.initial_window=30000 \
+    agent.adaptive_window.min_window=2000 \
+    agent.adaptive_window.max_window=30000
+
+
+
+ snel to local -   rsync -av rkasimahanti@snellius.surf.nl:~/new_rllm/rllm/  /Users/kasimahanti/rllm2/ 
+
+local to snel - rsync -av  /Users/kasimahanti/rllm2/ vfancois@snellius.surf.nl:~/new_rllm/ 
+
+
+
+
+srun --partition=gpu_a100 \
+     --gpus=1 \
+     --ntasks=1 \
+     --cpus-per-task=9 \
+     --mem=61434 \
+     --time=01:00:00 \
+     --pty bash -i
+--partition=
+# First check available CUDA modules
+module spider cuda
+
+# Load modules in correct order
+module purge
+module load 2023
+module load CUDA/12.4.0
+module load Anaconda3/2023.07-2
+
+# Verify CUDA is now available
+nvcc --version
+
+# Set CUDA environment variables
+export CUDA_HOME=/sw/arch/Centos8/EB_production/2023/software/CUDA/12.4.0
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+
+# Now create environment and install
+conda create -n rllm_venv python=3.10 -y
+source activate rllm_venv
+source activate verl
+
+pip install -e ./verl
+pip install -e .
+
+python -m rllm.trainer.adaptive_ppo \
+    --model_name "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B" \
+    --data_dir "data" \
+    --output_dir "outputs" \
+    --batch_size 4 \
+    --gradient_accumulation_steps 4 \
+    --learning_rate 1e-5 \
+    --max_length 8192 \
+    --initial_window_size 8192 \
+    --window_sizes 8192 16384 24576 32768 \
+    --clipping_threshold 0.05 \
+    --patience 100 \
+    --meta_controller_lr 1e-4 \
+    --base_reward_weight 1.0 \
+    --length_reward_weight 0.3 \
+    --incremental_reward_weight 0.2 \
+    --save_freq 1000 \
+    --test_freq 1000 \
+    --total_epochs 1 \
+    --logger wandb \
+    --project_name "rllm" \
+    --experiment_name "adaptive_ppo" \
+    --tensor_model_parallel_size 1 \
+    --gpu_memory_utilization 0.4 \
+    --ppo_mini_batch_size 128 \
+    --ppo_micro_batch_size 16 \
+    --critic_lr 1e-5 \
+    --kl_coef 0.001
+
+
+    ray start --head \
+    --node-ip-address=$(hostname -I | awk '{print $1}') \
+    --port=6379 \
+    --dashboard-host=0.0.0.0 \
+    --ray-client-server-port=10001
+
+srun --partition=gpu_a100 \
+     --nodes=1 \
+     --ntasks=1 \
+     --gres=gpu:2 \
+     --cpus-per-task=36 \
+     --mem=240G \
+     --time=1:00:00 \
+          --pty bash -i
+
+          srun --partition=gpu_a100 \
+     --nodes=1 \
+     --ntasks=1 \
+     --gres=gpu:2 \
+     --cpus-per-task=36 \
+     --mem=240G \
+     --time=01:00:00 \
+          --pty bash -i
+torchrun --nproc_per_node=2 --master_port=12345 train_countdown.py
+# Sample-based adaptive-COT (200 steps per window size)
+
+ssh -X rkasimahanti@snellius.surf.nl    
+vfrancois
+ssh -X vfrancois@snellius.surf.nl    
+
+ssh vfrancois@doornode.hpcv.surf.nl
+
+torchrun --nproc_per_node=2 --master_port=12345 train_countdown.py \
+    --adaptive_cot \
+    --steps_per_window 200 \
+    --sample_adaptive \
+    --sample_size 100 \
+    --eval_interval 200 \
+    --total_steps 1000 \
+    --slack 100 \
+    --save_freq 200
+
+# Baseline full-context training (static)
+torchrun --nproc_per_node=2 --master_port=12345 train_countdown.py \
+    --baseline \
+    --save_freq 200
+
+# Adaptive CoT only (no sample-based scheduling)
+torchrun --nproc_per_node=2 --master_port=12345 train_countdown.py \
+    --adaptive_cot \
+    --steps_per_window 200 \
+    --save_freq 200
+
+# Curriculum learning: train sequentially on n=3,4,5 numbers
+torchrun --nproc_per_node=2 --master_port=12345 train_countdown.py \
+    --curriculum \
+    --cl_num_samples 600 \
+    --cl_steps 200 \
+    --slack 100 \
+    --save_freq 200
+
+# Legacy inference (if needed)
+torchrun --nproc_per_node=2 --master_port=12345 inference_countdown.py
+
+torchrun --nproc_per_node=2 --master_port=12345 train_countdown.py --adaptive_cot --steps_per_window 200 --save_freq 200          
+
+torchrun  --nnodes=1 --nproc_per_node=2 train_countdown.py \
+  --curriculum \
+  --cl_num_samples 1000 \
+  --cl_steps 200 \
+  --slack 100 \
+
+
+  torchrun --nnodes=1 --nproc_per_node=2 train_countdown.py --curriculum --cl_num_samples 1000 --cl_steps 10 --slack 100 --save_freq 200
+
+  torchrun --nproc_per_node=2 --master_port=12345 train_countdown.py \
+  --adaptive_cot \
+  --steps_per_window 2 \
+  --save_freq 200
+
+
+  torchrun --nproc_per_node=2 --master_port=12345 train_countdown.py \
+  --curriculum \
+  --cl_num_samples 2 \
+  --cl_steps 2 \
+  --save_freq 200 \
+  --seed 0
+
+  torchrun --nproc_per_node=2 --master_port=12345 train_countdown.py \
+  --self_aware \
+  --cl_num_samples 2 \
+  --cl_steps 2 \
+
+torchrun --nproc_per_node=2 --master_port 12345 \
+         train_countdown.py --baseline --fixed_window 6400 \
+         --total_steps 2 
+
+
+    python scripts/test_countdown_inference.py --target 63 --numbers 24 42 16 --max_tokens 1024
+
+
+rllm2 % rsync -av /Users/kasimahanti/rllm2/*  vfrancois@snellius.surf.nl:~/new_rllm/
+Azertyuiop&é"'(0
+
+srun --partition=gpu_h100 \
+     --nodes=1 \
+     --ntasks=1 \
+     --gres=gpu:1 \
+     --cpus-per-task=36 \
+     --mem=240G \
+     --time=01:00:00 \
+          --pty bash -i
+
+          echo "Evaluating base model (no fine-tuning)..."
+python evaluate_model.py \
+    --checkpoint_path ./checkpoints/baseline_800/ \
+    --model_name   deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B\
+    --test_data ./data/test_dataset.pkl \
+    --window_size 800 \
+    --output_dir "evaluation_results/base_model" \
+    --save_plots
+
+pip install flash_attn==2.5.8
+
+rsync -av /Users/kasimahanti/rllm2/*  vfrancois@snellius.surf.nl:~/new_rllm/
+
+
+ray stop --force || true
+
+ pip install flash-attn==2.5.8 --no-build-isolation
+
+Azertyuiop&é"'(0
+
+rsync -av /Users/kasimahanti/rllm2/*  vfrancois@snellius.surf.nl:~/new_rllm/
+
+ssh vfrancois@doornode.hpcv.surf.nl
+rsync -av /Users/kasimahanti/rllm2/TinyZero/  vfrancois@snellius.surf.nl:~/new_rllm/
+
+
+
+python examples/deepscaler/prepare_math_data.py
+
+module load 2023
+module load CUDA/12.4.0
+pip install flash-attn==2.5.1.post1 --no-build-isolation
+
+
+/gpfs/home6/vfrancois/new_rllm/rllm/data/datasets/deepscaler_math/train.parquet
+
+/home/vfrancois/new_rllm/rllm/data/datasets/countdown/train.parquet
+
+
+conda activate zero
+python ./examples/data_preprocess/countdown.py --local_dir ./
+
+ rsync -av /Users/kasimahanti/rllm2/TinyZero/*  vfrancois@snellius.surf.nl:~/new_rllm/TinyZero/
+
+conda create -n zero2 python=3.9
+# install torch [or you can skip this step and let vllm to install the correct version for you]
+pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
+# install vllm
+pip3 install vllm==0.6.3 # or you can install 0.5.4, 0.4.2 and 0.3.1
+pip3 install ray
+
+# verl
+pip install -e .
+
+# flash attention 2
+pip3 install flash-attn --no-build-isolation
+# quality of life
+pip install wandb IPython matplotlib
+
+
+
+conda create -n zeroo python=3.9
+# install torch [or you can skip this step and let vllm to install the correct version for you]
+pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
+# install vllm
+pip3 install vllm==0.6.3 # or you can install 0.5.4, 0.4.2 and 0.3.1
+pip3 install ray
+
+# verl
+pip install -e .
+
+# flash attention 2
+pip3 install flash-attn --no-build-isolation
+# quality of life
+pip install wandb IPython matplotlib
+
+
+
+
+Qwen/Qwen2.5-0.5B-Instruct
+deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+export N_GPUS=4
+export BASE_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+export DATA_DIR=./
+export ROLLOUT_TP_SIZE=2  # Must divide N_GPUS! With 3 GPUs: use 1 or 3 (not 2)
+export EXPERIMENT_NAME=1.5B-Full-Think-Latest
+export VLLM_ATTENTION_BACKEND=XFORMERS
+
+bash ./scripts/train_tiny_zero.sh
+
+Azertyuiop&é"'(0
+
+
+python scripts/eval_countdown_model.py \
+  --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+  --data_dir ./ \
+  --split test \
+  --max_response_length 4096 \
+  --batch_size 1312

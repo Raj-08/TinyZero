@@ -176,10 +176,11 @@ def main_task(config):
         role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
         mapping[Role.RewardModel] = critic_pool_id
 
-    reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0)
+    cosine_cfg = getattr(config.algorithm, "cosine_reward", None)
+    reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0, cosine_cfg=cosine_cfg)
 
     # Note that we always use function-based RM for validation
-    val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=1)
+    val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=1, cosine_cfg=cosine_cfg)
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
