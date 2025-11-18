@@ -82,16 +82,28 @@ We experiment with QWen-2.5-3B Instruct too.
 To follow chat template, we need to reprocess the data:
 ```
 conda activate zero
-python examples/data_preprocess/countdown.py --template_type=qwen-instruct --local_dir={path_to_your_dataset}
+python examples/data_preprocess/countdown.py --template_type=qwen-instruct --local_dir=./
 ```
 
-**Training**
+**Training on Adaptive Rollout**
 ```
-export N_GPUS=2
-export BASE_MODEL={path_to_your_model}
-export DATA_DIR={path_to_your_dataset}
+export N_GPUS=4
+export BASE_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+export DATA_DIR=./
 export ROLLOUT_TP_SIZE=2
-export EXPERIMENT_NAME=countdown-qwen2.5-3b-instruct
+export EXPERIMENT_NAME=countdown-adaptive
+export VLLM_ATTENTION_BACKEND=XFORMERS
+
+bash ./scripts/train_tiny_zero_adaptive.sh
+```
+
+**Training on Fixed Rollout**
+```
+export N_GPUS=4
+export BASE_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+export DATA_DIR=./
+export ROLLOUT_TP_SIZE=2
+export EXPERIMENT_NAME=countdown-adaptive
 export VLLM_ATTENTION_BACKEND=XFORMERS
 
 bash ./scripts/train_tiny_zero.sh
