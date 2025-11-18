@@ -97,6 +97,77 @@ export VLLM_ATTENTION_BACKEND=XFORMERS
 bash ./scripts/train_tiny_zero.sh
 ```
 
+## Adaptive rollout extensions
+
+This fork adds several new ways to control the rollout length and analyze long‑context RL runs on Countdown.
+
+### Training modes
+
+- **Full rollout (baseline)**  
+  - Script: `scripts/train_tiny_zero.sh`  
+  - Fixed maximum response length (e.g. 4096 tokens) for the entire run.
+
+- **Adaptive window (ARPO‑style)**  
+  - Script: `scripts/train_tiny_zero_adaptive.sh`  
+  - Uses `AdaptiveSuccessWindowController` (`verl/trainer/ppo/adaptive_window.py`) to:
+    - Start from a warm‑up window based on the mean length of correct responses.
+    - Track batch‑level success rate and success length.
+    - **Shrink** the window when success is high and the model under‑uses length.
+    - **Grow** the window when success is low or the model is saturating the current window.
+    - Occasionally explore the max window via epsilon‑greedy.
+  - All behavior is controlled by `agent.adaptive_window.*` in `verl/trainer/config/ppo_trainer.yaml`.
+
+- **Phased schedule (manual curriculum)**  
+  - Script: `scripts/train_tiny_zero_phased.sh`  
+  - Runs individual phases at fixed lengths (512 / 1024 / 2048 / 4096).  
+  - Script: `scripts/train_tiny_zero_phased_schedule.sh`  
+    - Chains phases into a 4‑stage curriculum, e.g. 200 steps @ 512, 100 @ 1024, 50 @ 2048, 50 @ 4096.
+
+- **Cosine rollout schedule**  
+  - Script: `scripts/train_tiny_zero_cosine.sh`  
+  - Interpolates the rollout length between `L_MIN` and `L_MAX` over several phases using a cosine schedule:
+    - Configure with `L_MIN`, `L_MAX`, `N_PHASES` environment variables.
+
+- **Vanilla fixed‑length baseline**  
+  - Script: `scripts/train_tiny_zero_vanilla.sh`  
+  - Disables the adaptive controller (`agent.adaptive_window.enable=False`) and keeps a fixed `data.max_response_length`.
+
+All these modes share the same PPO/GRPO trainer (`verl/trainer/ppo/ray_trainer.py`) and configuration file (`verl/trainer/config/ppo_trainer.yaml`).
+
+### GRPO and reward shaping
+
+- By default, this fork uses **GRPO**:
+  - `algorithm.adv_estimator=grpo`,
+  - multiple samples per prompt (`actor_rollout_ref.rollout.n`),
+  - actor‑side KL loss (`use_kl_loss=True`, `kl_loss_type=low_var_kl`).
+- The Countdown reward is purely **binary correctness**:
+  - `verl/utils/reward_score/countdown.py` uses `format_score=0.0`, so “format‑correct but wrong answer” gets 0.
+  - This avoids reward hacking where the model gets partial credit for nicely formatted but incorrect equations.
+- Optional **cosine reward shaping** can be enabled via `algorithm.cosine_reward.enable=True` to modulate rewards as a function of response length.
+
+### Metrics and analysis
+
+To study stability and efficiency, the trainer logs additional metrics to W&B:
+
+- **Adaptive window behavior**
+  - `adaptive_window/current_window`, `adaptive_window/mean_success_length`, `adaptive_window/success_rate`, etc.
+- **Importance sampling diagnostics**
+  - `actor/is_ratio/mean`, `actor/is_ratio/std`, `actor/is_ratio/p95`,
+  - `actor/is_log_ratio/mean`, `actor/is_log_ratio/std`,
+  - `actor/is_clip/outside_frac` (fraction of ratios beyond the PPO clip range).
+- **Token usage**
+  - `tokens/prompt_total`, `tokens/response_total`, `tokens/overall_total`.
+- **Completion quality**
+  - `completion/truncated_frac`, `completion/finished_frac`,
+  - accuracy conditioned on truncation status,
+  - average length of correct responses.
+- **Difficulty‑conditioned accuracy**
+  - `difficulty/3_acc`, `difficulty/4_acc` for Countdown, using the `difficulty` field added in preprocessing.
+- **Learning curves**
+  - `train/cumulative_reward` and `time/elapsed_s` to plot reward vs. wall‑clock.
+
+These metrics make it easy to compare full vs. adaptive vs. phased vs. cosine runs on both **final accuracy** and **compute efficiency (tokens / time)**.
+
 ## Acknowledge
 * We run our experiments based on [veRL](https://github.com/volcengine/verl).
 * We use Qwen2.5 series base model [Qwen2.5](https://github.com/QwenLM/Qwen2.5).
