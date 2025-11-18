@@ -30,7 +30,14 @@ pip install flash-attn --no-build-isolation
 
 # Quality of life
 pip install wandb IPython matplotlib
+
+Or on Snellius
+
+conda activate zero ( directly activates right conda env)
 ```
+
+
+
 
 ## Countdown task
 
